@@ -1,0 +1,14 @@
+.gdb_history
+bin
+libs
+obj
+.gradle/
+.idea/
+.code/
+.kotlin/
+**/*.iml
+build/
+local.properties
+ndk.properties
+*~
+/.vscode/settings.json

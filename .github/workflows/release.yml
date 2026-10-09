@@ -1,0 +1,141 @@
+name: release
+
+on:
+  push:
+    tags:
+      - '*'
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Get tag name
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            RAW_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            RAW_TAG="v1.0.0"
+          fi
+          echo "VERSION_TAG=$RAW_TAG" >> $GITHUB_ENV
+          echo "MAVEN_VERSION=${RAW_TAG#v}" >> $GITHUB_ENV
+
+      - name: Export env vars
+        run: buildscripts/include/ci.sh export >>$GITHUB_ENV
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf pkg-config libtool ninja-build python3-pip nasm gperf zip curl
+          sudo pip3 install meson
+
+      - name: Build the release artifacts
+        run: |
+          set -x
+          unset ANDROID_SDK_ROOT
+          cd buildscripts
+          ./download.sh > /dev/null
+          ./buildall.sh --arch armv7l mpv
+          ./buildall.sh --arch arm64 mpv
+          ./buildall.sh --arch x86 mpv
+          ./buildall.sh --arch x86_64 mpv
+          ./buildall.sh
+        env:
+          GRADLE_OPTS: -Xmx4G
+
+      # Keep the built AAR even if a later step fails.
+      - name: Upload AAR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpv-android-lib-${{ github.sha }}
+          path: app/build/outputs/aar/*-release.aar
+          if-no-files-found: warn
+          retention-days: 30
+
+      # The upstream Maven Central publish needs secrets this fork does not
+      # have; without continue-on-error it would abort the release steps below.
+      - name: Publish and Upload to Maven Central Portal
+        continue-on-error: true
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: |
+          set -e
+          ./gradlew :app:publishReleasePublicationToBuildDirRepository
+          cd app/build/repo
+          zip -r ../central-bundle.zip .
+          cd ../../..
+          TOKEN=$(printf "%s:%s" "$MAVEN_CENTRAL_USERNAME" "$MAVEN_CENTRAL_PASSWORD" | base64 -w 0)
+          echo "Uploading bundle to Sonatype Central Portal..."
+          curl --fail-with-body -X POST "https://central.sonatype.com/api/v1/publisher/upload?publishingType=AUTOMATIC" \
+            -H "Authorization: Bearer $TOKEN" \
+            -F "bundle=@app/build/central-bundle.zip"
+
+      # Glob the AAR instead of hardcoding the name, and record the exact
+      # upstream source revisions so the LGPL "corresponding source" can be pinned.
+      - name: Copy build artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -e
+          AAR=$(ls app/build/outputs/aar/*-release.aar | head -n1)
+          echo "using $AAR"
+          cp "$AAR" mpv-android-lib-${VERSION_TAG}.aar
+          ls -l mpv-android-lib-${VERSION_TAG}.aar
+          {
+            echo "# mpv-android-lib ${VERSION_TAG} (LGPL build)"
+            echo
+            echo "AAR sha256: $(sha256sum mpv-android-lib-${VERSION_TAG}.aar)"
+            echo
+            echo "## Source revisions (git rev-parse HEAD)"
+            for d in ffmpeg mpv libplacebo dav1d libass freetype2; do
+              printf '%s: %s\n' "$d" "$(git -C buildscripts/deps/$d rev-parse HEAD 2>/dev/null || echo n/a)"
+            done
+            echo
+            echo "## ffmpeg configure (license-relevant part)"
+            grep -n 'enable-{jni' buildscripts/scripts/ffmpeg.sh || true
+          } > revisions.txt
+          cat revisions.txt
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION_TAG }}
+          name: mpv-android-lib ${{ env.VERSION_TAG }}
+          body: |
+            ### mpv-android-lib ${{ env.VERSION_TAG }}
+
+            LGPLv3 build of the libmpv / FFmpeg Android library.
+
+            - FFmpeg is built **without** `--enable-gpl` (with `--enable-version3`), so this
+              library is LGPL-3.0-or-later rather than GPLv3.
+            - Build recipe: `buildscripts/scripts/ffmpeg.sh` on branch `kernel-lgpl`.
+            - Source revisions used for this build: see `revisions.txt`.
+            - Corresponding source bundle: `libmpv-ffmpeg-android-sources-${{ env.VERSION_TAG }}.tar.gz`
+
+            Maven Central coordinates (not published from this fork):
+            ```gradle
+            implementation("io.github.marlboro-advance:mpv-android:${{ env.MAVEN_VERSION }}")
+            ```
+
+            Includes all native ABIs (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`).
+          files: |
+            mpv-android-lib-${{ env.VERSION_TAG }}.aar
+            revisions.txt
+          draft: false
+          prerelease: false
