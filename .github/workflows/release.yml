@@ -1,10 +1,7 @@
 name: release
 
 on:
-  push:
-    tags:
-      - '*'
-
+  # Manual only: a push must never silently replace a published binary.
   workflow_dispatch:
 
 jobs:
